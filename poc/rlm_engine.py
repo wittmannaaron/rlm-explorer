@@ -11,12 +11,15 @@ Sub-agents can be spawned to process chunks in parallel.
 import asyncio
 import io
 import contextlib
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 from openai import OpenAI
+
+logger = logging.getLogger("rlm_engine")
 
 
 # ---------------------------------------------------------------------------
@@ -27,10 +30,11 @@ from openai import OpenAI
 class RLMConfig:
     primary_model: str = "gpt-5.2"
     sub_model: str = "gpt-5.2"
-    max_depth: int = 5
+    max_depth: int = 2              # 0=root, 1=sub-agents, 2=leaf (keep shallow!)
     max_calls_per_agent: int = 25
     truncate_len: int = 10000
     max_total_tokens: int = 1_500_000
+    max_concurrent_agents: int = 12  # Global limit on parallel sub-agents
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     timeout: int = 180
@@ -241,6 +245,9 @@ class REPLSandbox:
         """Execute Python code synchronously and return captured stdout."""
         stdout_capture = io.StringIO()
         self._final_set = False
+        code_preview = code[:120].replace('\n', '\\n')
+        logger.debug(f"REPL execute: {code_preview}...")
+        exec_start = time.time()
 
         try:
             if "await " in code:
@@ -264,6 +271,9 @@ class REPLSandbox:
                     exec(compile(code, "<repl>", "exec"), self._globals)
         except Exception as e:
             stdout_capture.write(f"\nError: {type(e).__name__}: {e}\n")
+
+        exec_elapsed = time.time() - exec_start
+        logger.debug(f"REPL execute finished in {exec_elapsed:.2f}s (final_set={self._final_set})")
 
         output = stdout_capture.getvalue()
 
@@ -312,7 +322,9 @@ def _shutdown_loop(loop: asyncio.AbstractEventLoop):
 # ---------------------------------------------------------------------------
 
 # Shared thread pool for parallel sub-agent execution
-_executor = ThreadPoolExecutor(max_workers=8)
+_executor = ThreadPoolExecutor(max_workers=12)
+# Global semaphore to limit concurrent sub-agents (set per-engine in run())
+_agent_semaphore: Optional[asyncio.Semaphore] = None
 
 
 class RLMEngine:
@@ -357,6 +369,8 @@ class RLMEngine:
         self.usage = UsageStats(start_time=time.time())
         self.steps_log = []
         self._new_findings = []
+        self._max_concurrent = self.config.max_concurrent_agents
+        logger.info(f"=== RLM run() started | prompt={user_prompt[:100]!r}... | context={len(context):,} chars | max_depth={self.config.max_depth} max_concurrent={self._max_concurrent} ===")
 
         # Build the full context string
         full_context = ""
@@ -380,9 +394,15 @@ class RLMEngine:
         if user_prompt:
             full_context += f"\n\n[USER QUERY]\n{user_prompt}"
 
+        logger.info(f"Full context assembled: {len(full_context):,} chars | history_turns={len(conversation_history) if conversation_history else 0} | findings={len(findings) if findings else 0}")
         result = self._run_agent(full_context, depth=0, findings=findings or [])
 
         self.usage.end_time = time.time()
+        logger.info(
+            f"=== RLM run() finished in {self.usage.elapsed_seconds:.1f}s | "
+            f"llm_calls={self.usage.llm_calls} sub_agents={self.usage.sub_agent_calls} "
+            f"total_tokens={self.usage.total_tokens:,} ==="
+        )
         return {
             "answer": str(result) if result is not None else "No answer produced.",
             "usage": self.usage.to_dict(),
@@ -395,6 +415,8 @@ class RLMEngine:
         model = self.config.primary_model if depth == 0 else self.config.sub_model
         is_leaf = depth >= self.config.max_depth
         system = LEAF_SYSTEM_PROMPT if is_leaf else SYSTEM_PROMPT
+        agent_start = time.time()
+        logger.info(f"[depth={depth}] Agent started | model={model} leaf={is_leaf} context_len={len(context):,}")
 
         sandbox = REPLSandbox()
         sandbox.set_variable("context", context)
@@ -418,14 +440,22 @@ class RLMEngine:
 
         sandbox.set_variable("add_finding", add_finding)
 
-        # Set up llm_query for non-leaf agents.
-        # It's async so the REPL can use `await llm_query(...)` and asyncio.gather().
-        # Internally it runs the synchronous _run_agent in a thread pool.
-        if not is_leaf:
+        # Set up llm_query ONLY for root agent (depth=0).
+        # Sub-agents at depth>=1 are leaf-like: they analyze their chunk directly
+        # without spawning further sub-agents. This prevents exponential explosion.
+        if depth == 0:
             engine_ref = self
+            max_concurrent = self._max_concurrent
 
             async def llm_query(prompt: str) -> str:
+                # Check total sub-agent count before spawning
+                if engine_ref.usage.sub_agent_calls >= max_concurrent * 2:
+                    logger.warning(f"[depth={depth}] Sub-agent limit reached ({engine_ref.usage.sub_agent_calls}), skipping")
+                    return "[SUB-AGENT LIMIT REACHED - too many concurrent agents. Reduce chunk count.]"
+                sub_id = engine_ref.usage.sub_agent_calls + 1
                 engine_ref.usage.sub_agent_calls += 1
+                logger.info(f"[depth={depth}] Spawning sub-agent #{sub_id} at depth={depth+1} | prompt_len={len(prompt):,}")
+                sub_start = time.time()
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     _executor,
@@ -433,7 +463,10 @@ class RLMEngine:
                     prompt,
                     depth + 1,
                 )
-                return str(result) if result is not None else ""
+                sub_elapsed = time.time() - sub_start
+                result_str = str(result) if result is not None else ""
+                logger.info(f"[depth={depth}] Sub-agent #{sub_id} returned in {sub_elapsed:.1f}s | result_len={len(result_str):,}")
+                return result_str
 
             sandbox.set_variable("llm_query", llm_query)
 
@@ -494,18 +527,25 @@ class RLMEngine:
 
         for step in range(self.config.max_calls_per_agent):
             if self.usage.total_tokens > self.config.max_total_tokens:
+                logger.warning(f"[depth={depth}] Token budget exceeded: {self.usage.total_tokens:,} > {self.config.max_total_tokens:,}")
                 return "Error: Token budget exceeded."
 
             # Call LLM (synchronous)
             self.usage.llm_calls += 1
+            llm_start = time.time()
+            msg_count = len(messages)
+            msg_chars = sum(len(m.get("content", "")) for m in messages)
+            logger.info(f"[depth={depth} step={step+1}] LLM call #{self.usage.llm_calls} | model={model} msgs={msg_count} msg_chars={msg_chars:,}")
             try:
                 response = self.client.chat.completions.create(
                     model=model,
                     messages=[{"role": "system", "content": system}] + messages,
                 )
             except Exception as e:
+                logger.error(f"[depth={depth} step={step+1}] LLM API Error after {time.time()-llm_start:.1f}s: {e}")
                 return f"LLM API Error: {e}"
 
+            llm_elapsed = time.time() - llm_start
             # Track usage
             if response.usage:
                 self.usage.prompt_tokens += response.usage.prompt_tokens or 0
@@ -515,6 +555,12 @@ class RLMEngine:
                     self.usage.cached_tokens += getattr(
                         response.usage.prompt_tokens_details, "cached_tokens", 0
                     ) or 0
+            logger.info(
+                f"[depth={depth} step={step+1}] LLM response in {llm_elapsed:.1f}s | "
+                f"tokens: prompt={response.usage.prompt_tokens if response.usage else '?'} "
+                f"completion={response.usage.completion_tokens if response.usage else '?'} "
+                f"total_so_far={self.usage.total_tokens:,}"
+            )
 
             content = response.choices[0].message.content or ""
             messages.append({"role": "assistant", "content": content})
@@ -524,6 +570,7 @@ class RLMEngine:
             code = "\n".join(block.strip() for block in repl_blocks)
 
             if not code:
+                logger.warning(f"[depth={depth} step={step+1}] No repl block in LLM response ({len(content)} chars)")
                 messages.append({
                     "role": "user",
                     "content": "Error: No ```repl code block found. Please write Python code in a ```repl block."
@@ -532,10 +579,16 @@ class RLMEngine:
                 continue
 
             # Execute code (synchronous, async-await handled inside sandbox)
+            logger.info(f"[depth={depth} step={step+1}] Executing REPL code ({len(code)} chars)")
+            exec_start = time.time()
             output = sandbox.execute(code, self.config.truncate_len)
+            exec_elapsed = time.time() - exec_start
+            logger.info(f"[depth={depth} step={step+1}] REPL done in {exec_elapsed:.1f}s | output={len(output)} chars | final={sandbox.is_done}")
             self._log_step(depth, step + 1, code, output)
 
             if sandbox.is_done:
+                total_elapsed = time.time() - agent_start
+                logger.info(f"[depth={depth}] Agent DONE in {total_elapsed:.1f}s after {step+1} steps")
                 return sandbox.final_result
 
             messages.append({
@@ -543,6 +596,8 @@ class RLMEngine:
                 "content": f"Output:\n{output}"
             })
 
+        total_elapsed = time.time() - agent_start
+        logger.warning(f"[depth={depth}] Agent hit step limit ({self.config.max_calls_per_agent}) after {total_elapsed:.1f}s")
         return "Agent did not produce a final answer within the step limit."
 
     def _log_step(self, depth: int, step: int, code: str, output: str):

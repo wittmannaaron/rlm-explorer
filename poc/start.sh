@@ -23,9 +23,10 @@ python3 -m pip install -q flask flask-cors openai 2>/dev/null || python3 -m pip 
 # Optional: configure model (defaults to gpt-5.2)
 export RLM_PRIMARY_MODEL="${RLM_PRIMARY_MODEL:-gpt-5.2}"
 export RLM_SUB_MODEL="${RLM_SUB_MODEL:-gpt-5.2}"
-export RLM_MAX_DEPTH="${RLM_MAX_DEPTH:-5}"
+export RLM_MAX_DEPTH="${RLM_MAX_DEPTH:-2}"
 export RLM_MAX_CALLS="${RLM_MAX_CALLS:-25}"
 export RLM_MAX_TOKENS="${RLM_MAX_TOKENS:-1500000}"
+export RLM_MAX_CONCURRENT="${RLM_MAX_CONCURRENT:-12}"
 export RLM_TIMEOUT="${RLM_TIMEOUT:-180}"
 
 echo ""
@@ -33,6 +34,7 @@ echo "=== RLM Chat PoC ==="
 echo "Primary Model: $RLM_PRIMARY_MODEL"
 echo "Sub Model:     $RLM_SUB_MODEL"
 echo "Max Depth:     $RLM_MAX_DEPTH"
+echo "Max Concurrent:$RLM_MAX_CONCURRENT"
 echo "Max Calls:     $RLM_MAX_CALLS"
 echo ""
 

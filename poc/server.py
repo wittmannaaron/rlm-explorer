@@ -6,7 +6,9 @@ Maintains per-session conversation history and findings buffer.
 """
 
 import json
+import logging
 import os
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -17,6 +19,35 @@ from flask_cors import CORS
 
 from rlm_engine import RLMEngine, RLMConfig
 from concat_context import concat_context
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, f"rlm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+# Reduce noise from third-party libraries
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.INFO)
+logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+logger = logging.getLogger("server")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,22 +75,22 @@ def load_context():
     global _context_text, _system_prompt
 
     if not os.path.exists(CONTEXT_CACHE):
-        print("Concatenating context files...")
+        logger.info("Concatenating context files...")
         concat_context(CONTEXT_DIR, CONTEXT_CACHE)
 
-    print(f"Loading context from {CONTEXT_CACHE}...")
+    logger.info(f"Loading context from {CONTEXT_CACHE}...")
     with open(CONTEXT_CACHE, "r", encoding="utf-8") as f:
         _context_text = f.read()
-    print(f"Context loaded: {len(_context_text):,} characters (~{len(_context_text)//4:,} tokens)")
+    logger.info(f"Context loaded: {len(_context_text):,} characters (~{len(_context_text)//4:,} tokens)")
 
     if os.path.exists(PROMPT_FILE):
         with open(PROMPT_FILE, "r", encoding="utf-8") as f:
             _system_prompt = f.read()
         _system_prompt = _system_prompt.replace("{date}", datetime.now().strftime("%d.%m.%Y"))
-        print(f"System prompt loaded from {PROMPT_FILE}")
+        logger.info(f"System prompt loaded from {PROMPT_FILE}")
     else:
         _system_prompt = ""
-        print("No PROMPT.md found, running without system prompt.")
+        logger.warning("No PROMPT.md found, running without system prompt.")
 
 
 def get_config() -> RLMConfig:
@@ -75,10 +106,11 @@ def get_config() -> RLMConfig:
         _config = RLMConfig(
             primary_model=os.environ.get("RLM_PRIMARY_MODEL", "gpt-5.2"),
             sub_model=os.environ.get("RLM_SUB_MODEL", "gpt-5.2"),
-            max_depth=int(os.environ.get("RLM_MAX_DEPTH", "5")),
+            max_depth=int(os.environ.get("RLM_MAX_DEPTH", "2")),
             max_calls_per_agent=int(os.environ.get("RLM_MAX_CALLS", "25")),
             truncate_len=int(os.environ.get("RLM_TRUNCATE_LEN", "10000")),
             max_total_tokens=int(os.environ.get("RLM_MAX_TOKENS", "1500000")),
+            max_concurrent_agents=int(os.environ.get("RLM_MAX_CONCURRENT", "12")),
             openai_api_key=api_key,
             timeout=int(os.environ.get("RLM_TIMEOUT", "180")),
         )
@@ -139,6 +171,9 @@ def chat():
     session_id, session = get_session(session_id)
     engine = RLMEngine(config)
 
+    logger.info(f"[session={session_id}] Chat request: {user_message[:200]!r}")
+    request_start = time.time()
+
     try:
         result = engine.run(
             context=_context_text,
@@ -146,6 +181,14 @@ def chat():
             system_prompt=_system_prompt,
             conversation_history=session["history"],
             findings=session["findings"],
+        )
+
+        request_elapsed = time.time() - request_start
+        logger.info(
+            f"[session={session_id}] Chat response in {request_elapsed:.1f}s | "
+            f"answer_len={len(result.get('answer', '')):,} | "
+            f"steps={len(result.get('steps', []))} | "
+            f"tokens={result.get('usage', {}).get('total_tokens', 0):,}"
         )
 
         # Update session: add this Q&A to history
@@ -170,6 +213,8 @@ def chat():
 
         return jsonify(result)
     except Exception as e:
+        request_elapsed = time.time() - request_start
+        logger.error(f"[session={session_id}] Chat FAILED after {request_elapsed:.1f}s: {e}", exc_info=True)
         return jsonify({
             "answer": f"Error: {str(e)}",
             "usage": {},
@@ -221,9 +266,10 @@ def reload_context():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    logger.info(f"Log file: {LOG_FILE}")
     load_context()
     port = int(os.environ.get("RLM_PORT", "5055"))
-    print(f"\nStarting RLM Chat Server on http://localhost:{port}")
-    print(f"Model: {get_config().primary_model}")
-    print(f"Open http://localhost:{port} in your browser\n")
+    logger.info(f"Starting RLM Chat Server on http://localhost:{port}")
+    logger.info(f"Model: {get_config().primary_model}")
+    logger.info(f"Open http://localhost:{port} in your browser")
     app.run(host="0.0.0.0", port=port, debug=False)
