@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RLM Chat – Proof of Concept</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --surface-light: #1f3460;
+            --primary: #e94560;
+            --primary-dim: #c73650;
+            --text: #eee;
+            --text-dim: #999;
+            --accent: #0f3460;
+            --green: #4ecca3;
+            --yellow: #f0c040;
+            --code-bg: #0d1b2a;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            background: var(--surface);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--surface-light);
+        }
+
+        header h1 { font-size: 18px; font-weight: 600; }
+        header h1 span { color: var(--primary); }
+
+        .header-controls {
+            font-size: 12px;
+            color: var(--text-dim);
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .badge {
+            background: var(--surface-light);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+
+        .badge.session {
+            color: var(--green);
+            border: 1px solid rgba(78, 204, 163, 0.3);
+        }
+
+        .badge.findings {
+            color: var(--yellow);
+            border: 1px solid rgba(240, 192, 64, 0.3);
+            cursor: pointer;
+        }
+
+        .header-btn {
+            background: none;
+            border: 1px solid var(--surface-light);
+            color: var(--text-dim);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .header-btn:hover { border-color: var(--primary); color: var(--text); }
+
+        .main-content {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        .chat-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .message {
+            max-width: 85%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            line-height: 1.5;
+            font-size: 14px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: var(--accent);
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: var(--surface);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.assistant .answer { margin-bottom: 8px; }
+
+        .message.system {
+            align-self: center;
+            background: transparent;
+            color: var(--text-dim);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        .usage-bar {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--surface-light);
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+
+        .usage-bar .metric {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .usage-bar .metric .val {
+            color: var(--green);
+            font-weight: 600;
+            font-family: 'SF Mono', 'Menlo', monospace;
+        }
+
+        .thinking-indicator {
+            align-self: flex-start;
+            padding: 12px 16px;
+            background: var(--surface);
+            border-radius: 12px;
+            border-bottom-left-radius: 4px;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: var(--text-dim);
+        }
+
+        .thinking-indicator.active { display: flex; }
+
+        .dots span {
+            display: inline-block;
+            width: 6px; height: 6px;
+            background: var(--primary);
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+        .dots span:nth-child(1) { animation-delay: 0s; }
+        .dots span:nth-child(2) { animation-delay: 0.2s; }
+        .dots span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+
+        .input-area {
+            padding: 12px 24px;
+            background: var(--surface);
+            border-top: 1px solid var(--surface-light);
+            display: flex;
+            gap: 8px;
+        }
+
+        .input-area textarea {
+            flex: 1;
+            background: var(--bg);
+            border: 1px solid var(--surface-light);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: var(--text);
+            font-size: 14px;
+            font-family: inherit;
+            resize: none;
+            min-height: 44px;
+            max-height: 120px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .input-area textarea:focus { border-color: var(--primary); }
+
+        .input-area button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 0 20px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        .input-area button:hover { background: var(--primary-dim); }
+        .input-area button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* Steps sidebar */
+        .steps-panel {
+            width: 380px;
+            background: var(--surface);
+            border-left: 1px solid var(--surface-light);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .steps-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--surface-light);
+        }
+
+        .steps-tab {
+            flex: 1;
+            padding: 10px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+        }
+        .steps-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+        .steps-tab:hover { color: var(--text); }
+
+        .tab-content { flex: 1; overflow-y: auto; padding: 8px; display: none; }
+        .tab-content.active { display: block; }
+
+        .step-item {
+            margin-bottom: 6px;
+            border-radius: 6px;
+            background: var(--bg);
+            overflow: hidden;
+        }
+
+        .step-header {
+            padding: 8px 10px;
+            font-size: 11px;
+            color: var(--text-dim);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .step-header:hover { background: var(--surface-light); }
+
+        .step-header .depth-badge {
+            background: var(--accent);
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+        }
+
+        .step-body { display: none; padding: 6px 10px 10px; font-size: 11px; }
+        .step-body.open { display: block; }
+
+        .step-body pre {
+            background: var(--code-bg);
+            padding: 8px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-family: 'SF Mono', 'Menlo', monospace;
+            font-size: 10px;
+            line-height: 1.4;
+            color: var(--green);
+            margin: 4px 0;
+            white-space: pre-wrap;
+        }
+
+        .step-body .label { color: var(--text-dim); margin-top: 6px; font-weight: 600; }
+
+        .finding-item {
+            margin-bottom: 6px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: var(--bg);
+            font-size: 12px;
+            line-height: 1.4;
+            border-left: 3px solid var(--yellow);
+        }
+
+        .finding-item .finding-idx {
+            color: var(--yellow);
+            font-weight: 600;
+            font-size: 10px;
+        }
+
+        .empty-state {
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 12px;
+            padding: 24px 12px;
+        }
+
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--surface-light); border-radius: 3px; }
+
+        @media (max-width: 768px) { .steps-panel { display: none; } }
+    </style>
+</head>
+<body>
+    <header>
+        <h1><span>RLM</span> Chat PoC</h1>
+        <div class="header-controls">
+            <span class="badge" id="modelBadge">Loading...</span>
+            <span class="badge" id="contextBadge">...</span>
+            <span class="badge session" id="sessionBadge">Session: —</span>
+            <span class="badge findings" id="findingsBadge" onclick="switchTab('findings')">Findings: 0</span>
+            <button class="header-btn" onclick="newSession()">Neue Session</button>
+            <button class="header-btn" onclick="toggleSteps()">Panel</button>
+        </div>
+    </header>
+
+    <div class="main-content">
+        <div class="chat-panel">
+            <div class="messages" id="messages">
+                <div class="message system">
+                    RLM Chat PoC – Der Context wird als Variable in einem Python-REPL geladen.
+                    Das LLM schreibt Code um den Context programmatisch zu durchsuchen.
+                    Findings werden über Folgefragen hinweg gespeichert.
+                </div>
+            </div>
+
+            <div class="thinking-indicator" id="thinking">
+                <div class="dots"><span></span><span></span><span></span></div>
+                <span>RLM arbeitet...</span>
+            </div>
+
+            <div class="input-area">
+                <textarea id="userInput" placeholder="Frage zum Context stellen..." rows="1"
+                    onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
+                <button id="sendBtn" onclick="sendMessage()">Senden</button>
+            </div>
+        </div>
+
+        <div class="steps-panel" id="stepsPanel">
+            <div class="steps-tabs">
+                <button class="steps-tab active" onclick="switchTab('steps')">Agent Steps</button>
+                <button class="steps-tab" onclick="switchTab('findings')">Findings</button>
+            </div>
+            <div class="tab-content active" id="stepsTab"></div>
+            <div class="tab-content" id="findingsTab">
+                <div class="empty-state">Noch keine Findings. Das LLM speichert hier wichtige Fundstellen.</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = '';
+        let isProcessing = false;
+        let sessionId = null;
+        let allFindings = [];
+
+        async function loadInfo() {
+            try {
+                const resp = await fetch(`${API}/api/info`);
+                const info = await resp.json();
+                document.getElementById('modelBadge').textContent = info.primary_model;
+                document.getElementById('contextBadge').textContent =
+                    `${(info.context_chars / 1000000).toFixed(1)}M chars (~${(info.context_tokens_estimate / 1000).toFixed(0)}K tokens)`;
+            } catch (e) {
+                document.getElementById('modelBadge').textContent = 'Offline';
+            }
+        }
+
+        function updateSessionBadge() {
+            document.getElementById('sessionBadge').textContent =
+                sessionId ? `Session: ${sessionId}` : 'Session: —';
+            document.getElementById('findingsBadge').textContent =
+                `Findings: ${allFindings.length}`;
+        }
+
+        function addMessage(role, content, usage, sessionInfo) {
+            const messages = document.getElementById('messages');
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+
+            if (role === 'assistant' && usage) {
+                const cumTokens = sessionInfo ? sessionInfo.cumulative_tokens : 0;
+                div.innerHTML = `
+                    <div class="answer">${escapeHtml(content)}</div>
+                    <div class="usage-bar">
+                        <div class="metric">Prompt: <span class="val">${(usage.prompt_tokens || 0).toLocaleString()}</span></div>
+                        <div class="metric">Completion: <span class="val">${(usage.completion_tokens || 0).toLocaleString()}</span></div>
+                        <div class="metric">Total: <span class="val">${(usage.total_tokens || 0).toLocaleString()}</span></div>
+                        <div class="metric">Cached: <span class="val">${(usage.cached_tokens || 0).toLocaleString()}</span></div>
+                        <div class="metric">LLM Calls: <span class="val">${usage.llm_calls || 0}</span></div>
+                        <div class="metric">Sub-Agents: <span class="val">${usage.sub_agent_calls || 0}</span></div>
+                        <div class="metric">Zeit: <span class="val">${usage.elapsed_seconds || 0}s</span></div>
+                        ${cumTokens ? `<div class="metric">Session Total: <span class="val">${cumTokens.toLocaleString()}</span></div>` : ''}
+                    </div>
+                `;
+            } else {
+                div.textContent = content;
+            }
+
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function showSteps(steps) {
+            const list = document.getElementById('stepsTab');
+            list.innerHTML = '';
+
+            for (const step of steps) {
+                const item = document.createElement('div');
+                item.className = 'step-item';
+
+                const header = document.createElement('div');
+                header.className = 'step-header';
+                header.innerHTML = `
+                    <span>Depth ${step.depth} / Step ${step.step}</span>
+                    <span class="depth-badge">D${step.depth}</span>
+                `;
+
+                const body = document.createElement('div');
+                body.className = 'step-body';
+                body.innerHTML = `
+                    <div class="label">Code:</div>
+                    <pre>${escapeHtml(step.code)}</pre>
+                    <div class="label">Output:</div>
+                    <pre>${escapeHtml(step.output)}</pre>
+                `;
+
+                header.onclick = () => body.classList.toggle('open');
+                item.appendChild(header);
+                item.appendChild(body);
+                list.appendChild(item);
+            }
+
+            const lastBody = list.querySelector('.step-item:last-child .step-body');
+            if (lastBody) lastBody.classList.add('open');
+            list.scrollTop = list.scrollHeight;
+        }
+
+        function updateFindings() {
+            const tab = document.getElementById('findingsTab');
+            if (allFindings.length === 0) {
+                tab.innerHTML = '<div class="empty-state">Noch keine Findings. Das LLM speichert hier wichtige Fundstellen.</div>';
+                return;
+            }
+            tab.innerHTML = '';
+            allFindings.forEach((f, i) => {
+                const item = document.createElement('div');
+                item.className = 'finding-item';
+                item.innerHTML = `<span class="finding-idx">#${i + 1}</span> ${escapeHtml(f)}`;
+                tab.appendChild(item);
+            });
+            tab.scrollTop = tab.scrollHeight;
+        }
+
+        function switchTab(name) {
+            document.querySelectorAll('.steps-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            if (name === 'findings') {
+                document.querySelectorAll('.steps-tab')[1].classList.add('active');
+                document.getElementById('findingsTab').classList.add('active');
+            } else {
+                document.querySelectorAll('.steps-tab')[0].classList.add('active');
+                document.getElementById('stepsTab').classList.add('active');
+            }
+        }
+
+        async function newSession() {
+            sessionId = null;
+            allFindings = [];
+            updateSessionBadge();
+            updateFindings();
+            document.getElementById('messages').innerHTML = `
+                <div class="message system">
+                    Neue Session gestartet. Conversation History und Findings wurden zurückgesetzt.
+                </div>
+            `;
+            document.getElementById('stepsTab').innerHTML = '';
+        }
+
+        async function sendMessage() {
+            if (isProcessing) return;
+
+            const input = document.getElementById('userInput');
+            const message = input.value.trim();
+            if (!message) return;
+
+            input.value = '';
+            input.style.height = 'auto';
+            addMessage('user', message);
+
+            isProcessing = true;
+            document.getElementById('sendBtn').disabled = true;
+            document.getElementById('thinking').classList.add('active');
+
+            try {
+                const body = { message };
+                if (sessionId) body.session_id = sessionId;
+
+                const resp = await fetch(`${API}/api/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+
+                const result = await resp.json();
+
+                // Update session
+                if (result.session_id) sessionId = result.session_id;
+
+                // Merge findings
+                if (result.new_findings && result.new_findings.length > 0) {
+                    allFindings.push(...result.new_findings);
+                    updateFindings();
+                }
+
+                updateSessionBadge();
+                addMessage('assistant', result.answer, result.usage, result.session_info);
+
+                if (result.steps) showSteps(result.steps);
+            } catch (e) {
+                addMessage('system', `Fehler: ${e.message}`);
+            } finally {
+                isProcessing = false;
+                document.getElementById('sendBtn').disabled = false;
+                document.getElementById('thinking').classList.remove('active');
+            }
+        }
+
+        function toggleSteps() {
+            const panel = document.getElementById('stepsPanel');
+            panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+        }
+
+        document.getElementById('userInput').addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+        });
+
+        loadInfo();
+    </script>
+</body>
+</html>
