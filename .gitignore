@@ -19,8 +19,12 @@ dist/
 context/
 poc/full_context.txt
 
+# Internal docs & handover (private)
+docs/
+
 # Runtime outputs
 poc/outputs/
+poc/logs/
 logs/
 
 # IDE

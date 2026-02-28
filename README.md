@@ -72,12 +72,11 @@ rlm-explorer/
 │   ├── concat_context.py     # Concatenates .txt files into single context
 │   ├── start.sh              # Start script with env defaults
 │   ├── requirements.txt      # Python dependencies
+│   ├── logs/                 # Timestamped log files (gitignored)
 │   └── static/
 │       └── index.html        # Chat UI (dark theme, steps viewer, findings panel)
-├── context/                  # Your documents go here (gitignored)
-│   └── PROMPT.md             # Optional: domain-specific agent briefing
-└── docs/
-    └── plans/                # Implementation plans
+└── context/                  # Your documents go here (gitignored)
+    └── PROMPT.md             # Optional: domain-specific agent briefing
 ```
 
 ## Configuration
@@ -87,21 +86,29 @@ Environment variables (set before running or in `.env`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | (required) | Your OpenAI API key |
-| `RLM_PRIMARY_MODEL` | `gpt-5.2` | Model for the main agent |
+| `RLM_PRIMARY_MODEL` | `gpt-5.2` | Model for the root agent |
 | `RLM_SUB_MODEL` | `gpt-5.2` | Model for sub-agents |
-| `RLM_MAX_DEPTH` | `5` | Maximum recursion depth |
-| `RLM_MAX_CALLS` | `25` | Max REPL steps per agent |
+| `RLM_MAX_DEPTH` | `2` | Agent depth limit (0=root, 1=sub, 2=leaf) |
+| `RLM_MAX_CALLS` | `25` | Max REPL steps for root agent |
+| `RLM_SUB_AGENT_CALLS` | `8` | Max REPL steps per sub-agent |
+| `RLM_MAX_LLM_CALLS` | `50` | Hard global limit across all agents |
+| `RLM_ROOT_RESERVED` | `5` | LLM calls reserved for root synthesis |
+| `RLM_MAX_CONCURRENT` | `12` | Max parallel sub-agents |
 | `RLM_MAX_TOKENS` | `1500000` | Token budget per query |
+| `RLM_TRUNCATE_LEN` | `10000` | REPL output truncation (chars) |
 | `RLM_TIMEOUT` | `180` | API call timeout (seconds) |
 | `RLM_PORT` | `5055` | Server port |
 
 ## Features
 
-- **Parallel sub-agents**: The agent can spawn multiple sub-agents via `asyncio.gather()` to search different context chunks simultaneously
+- **Parallel sub-agents**: The root agent chunks the context and spawns up to 12 sub-agents via `asyncio.gather()` to search different sections simultaneously
+- **Two-phase execution**: The engine enforces a two-phase pattern — Phase 1 (search via sub-agents) and Phase 2 (synthesis with actual results visible). If the LLM calls `FINAL()` prematurely in the same step as `gather()`, the engine suppresses it and forces a second turn
+- **Fallback synthesis**: If the REPL loop exhausts its call budget without producing an answer, a dedicated LLM call outside the loop synthesizes sub-agent results into a coherent response
 - **Session memory**: Conversation history (last 10 turns) and a persistent findings buffer that carries key facts across queries
 - **Briefing system**: A `[BRIEFING]` block at the start of the context defines the agent's role, domain knowledge, and response guidelines — read automatically on each query
 - **Smart initial inspection**: The agent starts each query with a structural overview: briefing content, document index, previous findings, and the user's question
 - **Step viewer**: The chat UI shows every REPL step (code + output) at each depth level for full transparency
+- **Budget controls**: Hard limits on LLM calls, tokens, concurrent agents, and recursion depth prevent runaway costs
 
 ## Domain briefing (PROMPT.md)
 
