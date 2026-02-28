@@ -135,14 +135,26 @@ You can use variables as buffers to build up your final answer.
 ** MANDATORY RESEARCH STRATEGY for large contexts (>100K chars) **
 Make sure to explicitly look through as much context as possible before answering. Your strategy MUST be:
 
+*** TWO-PHASE APPROACH (CRITICAL — you MUST follow this) ***
+
+PHASE 1 — Search (one ```repl block, do NOT call FINAL here):
 1. Read the [BRIEFING] block to understand your role and the case
 2. Build a document index: extract all [DOCUMENT: ...] markers with their positions
 3. Chunk the context into segments (e.g. 400K chars each for ~4.8M context = ~12 chunks)
-4. Launch PARALLEL subagents with `asyncio.gather()` — one per chunk — each searching for information relevant to the query
-5. Collect and review all subagent results
-6. Save key findings with `add_finding()`
-7. Synthesize the answer YOURSELF in Python — do NOT use llm_query for synthesis! Just combine the subagent results with string operations. The subagents already did the analysis; you just need to format and merge their findings.
-8. Print your answer to inspect it, then call FINAL()
+4. Launch PARALLEL subagents with `asyncio.gather()` — one per chunk
+5. Print a summary of each result (first 500 chars) so you can review them
+6. Do NOT call FINAL() in this block! You need to review the results first.
+
+PHASE 2 — Synthesize (a SEPARATE ```repl block, AFTER seeing Phase 1 output):
+1. Review the subagent results (stored in your `answers` variable from Phase 1)
+2. Filter out error messages ([CALL LIMIT...], [TOKEN BUDGET...], empty results)
+3. Extract key findings and relevant document references
+4. Save important findings with `add_finding()`
+5. Build a well-structured, comprehensive answer in German
+6. Print the answer to verify, then call FINAL()
+
+*** WHY TWO PHASES? ***
+If you call FINAL() in the same block as asyncio.gather(), you are writing the synthesis code BEFORE seeing the sub-agent results. This produces garbage. Instead, let Phase 1 finish, review the printed output, then write synthesis code in Phase 2.
 
 Sub-LLMs are powerful — they can fit around 500K characters. Don't be afraid to put a lot of context into them. A viable strategy is to split 4.8M chars into 10 chunks and run 10 parallel subagents.
 
@@ -151,6 +163,7 @@ Sub-LLMs are powerful — they can fit around 500K characters. Don't be afraid t
 - Subagents that are parallel tend to finish 10x faster
 - Maximize subagent parallelization with `asyncio.gather(*tasks)`
 
+*** PHASE 1 EXAMPLE — Search (do NOT call FINAL here!) ***
 ```repl
 import asyncio
 
@@ -167,9 +180,10 @@ for i in range(10):
 answers = await asyncio.gather(*tasks)
 for i, answer in enumerate(answers):
     print(f"Chunk {i}: {answer[:500]}")
+# Do NOT call FINAL() here — wait for Phase 2!
 ```
 
-After collecting chunk results, synthesize DIRECTLY in Python (do NOT call llm_query again!):
+*** PHASE 2 EXAMPLE — Synthesize (in a NEW ```repl block after reviewing Phase 1 output) ***
 ```repl
 # Combine all non-empty results
 parts = []
@@ -189,6 +203,7 @@ FINAL(final_answer)
 ```
 
 CRITICAL: Do NOT use `llm_query` for the final synthesis step — you will run out of budget! Just combine results with Python string operations and call FINAL() directly.
+CRITICAL: Do NOT call FINAL() in the same ```repl block as asyncio.gather(). The engine will suppress premature FINAL calls and give you a second turn.
 
 IMPORTANT: When you are done, you MUST provide a final answer using FINAL(). Two options:
 1. Use FINAL("your final answer here") for direct answers
@@ -546,6 +561,7 @@ class RLMEngine:
 
         # Sub-agents get fewer REPL rounds than the root agent
         max_steps = self.config.max_calls_per_agent if depth == 0 else self.config.sub_agent_max_calls
+        phase2_forced = False  # Track whether we've already forced a synthesis phase
 
         for step in range(max_steps):
             # --- PRE-CHECKS before each LLM call ---
@@ -615,13 +631,68 @@ class RLMEngine:
                 self._log_step(depth, step + 1, "[no code]", "Waiting for repl block...")
                 continue
 
+            # Track sub-agent spawning for two-phase detection
+            sub_agents_before = self.usage.sub_agent_calls
+
             # Execute code (synchronous, async-await handled inside sandbox)
             logger.info(f"[depth={depth} step={step+1}] Executing REPL code ({len(code)} chars)")
             exec_start = time.time()
             output = sandbox.execute(code, self.config.truncate_len)
             exec_elapsed = time.time() - exec_start
-            logger.info(f"[depth={depth} step={step+1}] REPL done in {exec_elapsed:.1f}s | output={len(output)} chars | final={sandbox.is_done}")
+
+            sub_agents_this_step = self.usage.sub_agent_calls - sub_agents_before
+            logger.info(
+                f"[depth={depth} step={step+1}] REPL done in {exec_elapsed:.1f}s | "
+                f"output={len(output)} chars | final={sandbox.is_done} | "
+                f"sub_agents_spawned={sub_agents_this_step}"
+            )
             self._log_step(depth, step + 1, code, output)
+
+            # ---------------------------------------------------------------
+            # TWO-PHASE ENFORCEMENT for root agent:
+            # If the root agent called FINAL() in the same step where it
+            # spawned sub-agents, the synthesis was written BEFORE seeing
+            # results (the LLM predicted all code in one shot). Suppress
+            # the premature FINAL and give the agent a second LLM turn
+            # where it can see the actual sub-agent outputs and write
+            # proper synthesis code.
+            # ---------------------------------------------------------------
+            if (sandbox.is_done
+                    and depth == 0
+                    and sub_agents_this_step > 0
+                    and not phase2_forced):
+                premature_result = str(sandbox.final_result) if sandbox.final_result is not None else ""
+                result_len = len(premature_result)
+
+                # Reset FINAL state so the loop continues
+                sandbox._final_set = False
+                sandbox._final_result = None
+                phase2_forced = True
+
+                logger.info(
+                    f"[depth={depth} step={step+1}] PHASE 2 FORCED: "
+                    f"Suppressed premature FINAL ({result_len:,} chars) — "
+                    f"{sub_agents_this_step} sub-agents were spawned this step. "
+                    f"Giving root agent another turn for synthesis."
+                )
+
+                # Tell the LLM to review results and synthesize properly
+                synthesis_prompt = (
+                    f"Output:\n{output}\n\n"
+                    f"[SYNTHESIS PHASE] {sub_agents_this_step} sub-agents have completed. "
+                    f"Their results are stored in your REPL variables from the previous step "
+                    f"(e.g. the `answers` list from asyncio.gather). "
+                    f"Now write a NEW ```repl block that:\n"
+                    f"1. Reviews the sub-agent results stored in your variables\n"
+                    f"2. Filters out error messages ([CALL LIMIT...], [TOKEN BUDGET...], empty results)\n"
+                    f"3. Extracts key findings and relevant [DOCUMENT: ...] references\n"
+                    f"4. Builds a well-structured, comprehensive answer in German\n"
+                    f"5. Saves important findings with add_finding()\n"
+                    f"6. Calls FINAL(your_synthesized_answer)\n\n"
+                    f"Do NOT call llm_query() again — just use Python string operations."
+                )
+                messages.append({"role": "user", "content": synthesis_prompt})
+                continue
 
             if sandbox.is_done:
                 total_elapsed = time.time() - agent_start
