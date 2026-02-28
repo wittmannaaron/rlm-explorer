@@ -398,6 +398,7 @@ class RLMEngine:
         self.usage = UsageStats(start_time=time.time())
         self.steps_log = []
         self._new_findings = []
+        self._sub_agent_results = []  # Captured for fallback synthesis
         self._max_concurrent = self.config.max_concurrent_agents
         logger.info(f"=== RLM run() started | prompt={user_prompt[:100]!r}... | context={len(context):,} chars | max_depth={self.config.max_depth} max_concurrent={self._max_concurrent} ===")
 
@@ -425,6 +426,21 @@ class RLMEngine:
 
         logger.info(f"Full context assembled: {len(full_context):,} chars | history_turns={len(conversation_history) if conversation_history else 0} | findings={len(findings) if findings else 0}")
         result = self._run_agent(full_context, depth=0, findings=findings or [])
+
+        # --- Fallback synthesis ---
+        # If the REPL loop failed to produce a proper answer (call limit,
+        # token budget, raw dump, or no answer), use the captured sub-agent
+        # results and make one dedicated LLM call for synthesis outside
+        # the REPL loop entirely.
+        result_str = str(result) if result is not None else ""
+        if self._needs_fallback_synthesis(result_str):
+            logger.info(
+                f"Fallback synthesis triggered — agent returned: {result_str[:120]!r} | "
+                f"{len(self._sub_agent_results)} sub-agent results available"
+            )
+            fallback = self._fallback_synthesis(user_prompt, system_prompt)
+            if fallback:
+                result = fallback
 
         self.usage.end_time = time.time()
         logger.info(
@@ -500,6 +516,11 @@ class RLMEngine:
                 sub_elapsed = time.time() - sub_start
                 result_str = str(result) if result is not None else ""
                 logger.info(f"[depth={depth}] Sub-agent #{sub_id} returned in {sub_elapsed:.1f}s | result_len={len(result_str):,}")
+                engine_ref._sub_agent_results.append({
+                    "sub_id": sub_id,
+                    "result": result_str,
+                    "elapsed": sub_elapsed,
+                })
                 return result_str
 
             sandbox.set_variable("llm_query", llm_query)
@@ -707,6 +728,122 @@ class RLMEngine:
         total_elapsed = time.time() - agent_start
         logger.warning(f"[depth={depth}] Agent hit step limit ({max_steps}) after {total_elapsed:.1f}s")
         return "Agent did not produce a final answer within the step limit."
+
+    # ------------------------------------------------------------------
+    # Fallback synthesis — dedicated LLM call outside the REPL loop
+    # ------------------------------------------------------------------
+
+    def _needs_fallback_synthesis(self, result: str) -> bool:
+        """Check if the agent result is an error or raw dump that needs fallback."""
+        if not result or result == "No answer produced.":
+            return True
+        error_markers = [
+            "[CALL LIMIT REACHED",
+            "[TOKEN BUDGET EXCEEDED",
+            "[CALL BUDGET EXHAUSTED",
+            "LLM API Error",
+            "Agent did not produce a final answer",
+        ]
+        for marker in error_markers:
+            if marker in result:
+                return True
+        # Raw dump detection: unreasonably long answers are likely unprocessed
+        if len(result) > 100_000:
+            return True
+        return False
+
+    def _fallback_synthesis(self, user_prompt: str, system_prompt: str) -> Optional[str]:
+        """Synthesize sub-agent results via a direct LLM call (outside REPL).
+
+        This is the safety net: even if the REPL loop exhausts its budget,
+        we still produce a coherent answer from whatever the sub-agents found.
+        """
+        if not self._sub_agent_results:
+            logger.warning("Fallback synthesis: no sub-agent results available")
+            return None
+
+        # Filter out error results, keep real findings
+        parts = []
+        for item in self._sub_agent_results:
+            text = (item["result"] or "").strip()
+            if (text
+                    and "[CALL LIMIT" not in text
+                    and "[TOKEN BUDGET" not in text
+                    and "[CALL BUDGET" not in text
+                    and "[SUB-AGENT LIMIT" not in text
+                    and len(text) > 20):
+                parts.append(
+                    f"--- Sub-Agent #{item['sub_id']} ({item['elapsed']:.1f}s) ---\n{text}"
+                )
+
+        if not parts:
+            logger.warning("Fallback synthesis: all sub-agent results are empty or errors")
+            return None
+
+        combined = "\n\n".join(parts)
+        # Cap input to ~50K tokens to leave room for the synthesis prompt
+        max_input = 200_000
+        if len(combined) > max_input:
+            combined = combined[:max_input] + "\n\n[... gekürzt ...]"
+
+        synthesis_system = (
+            "Du bist ein Rechtsrecherche-Assistent. Du erhältst die Ergebnisse "
+            "von mehreren Such-Agenten, die jeweils verschiedene Abschnitte einer "
+            "Dokumentensammlung durchsucht haben. Deine Aufgabe ist es, deren "
+            "Ergebnisse zu einem umfassenden, gut strukturierten Bericht auf Deutsch "
+            "zusammenzuführen.\n\n"
+            "Regeln:\n"
+            "- Antworte auf Deutsch\n"
+            "- Referenziere Dokumente mit [DOCUMENT: Dateiname]\n"
+            "- Filtere leere oder fehlerhafte Ergebnisse heraus\n"
+            "- Strukturiere die Antwort klar mit Abschnitten und Aufzählungen\n"
+            "- Sei umfassend — alle relevanten Erkenntnisse einbeziehen\n"
+        )
+        if system_prompt:
+            # Include the domain briefing so synthesis respects the case context
+            synthesis_system += f"\nKontext-Briefing:\n{system_prompt}\n"
+
+        synthesis_user = (
+            f"Ursprüngliche Frage des Nutzers:\n{user_prompt}\n\n"
+            f"Ergebnisse von {len(parts)} Such-Agenten:\n\n{combined}\n\n"
+            f"Bitte fasse diese Ergebnisse zu einer umfassenden Antwort auf Deutsch "
+            f"zusammen. Referenziere konkrete Dokumentquellen wo möglich."
+        )
+
+        logger.info(
+            f"Fallback synthesis: {len(parts)} sub-agent results, "
+            f"{len(combined):,} chars input, making dedicated LLM call"
+        )
+        self._log_step(0, -1, "[FALLBACK SYNTHESIS — dedicated LLM call]",
+                        f"Input: {len(parts)} sub-agent results, {len(combined):,} chars")
+
+        try:
+            self.usage.llm_calls += 1
+            response = self.client.chat.completions.create(
+                model=self.config.primary_model,
+                messages=[
+                    {"role": "system", "content": synthesis_system},
+                    {"role": "user", "content": synthesis_user},
+                ],
+            )
+
+            if response.usage:
+                self.usage.prompt_tokens += response.usage.prompt_tokens or 0
+                self.usage.completion_tokens += response.usage.completion_tokens or 0
+                self.usage.total_tokens += response.usage.total_tokens or 0
+                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                    self.usage.cached_tokens += getattr(
+                        response.usage.prompt_tokens_details, "cached_tokens", 0
+                    ) or 0
+
+            answer = response.choices[0].message.content or ""
+            logger.info(f"Fallback synthesis produced {len(answer):,} chars")
+            self._log_step(0, -2, "[FALLBACK SYNTHESIS — result]", answer[:5000])
+            return answer
+
+        except Exception as e:
+            logger.error(f"Fallback synthesis LLM call failed: {e}")
+            return None
 
     def _log_step(self, depth: int, step: int, code: str, output: str):
         entry = {
