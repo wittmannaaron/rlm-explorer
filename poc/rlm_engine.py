@@ -35,6 +35,9 @@ class RLMConfig:
     truncate_len: int = 10000
     max_total_tokens: int = 1_500_000
     max_concurrent_agents: int = 12  # Global limit on parallel sub-agents
+    max_total_llm_calls: int = 50    # Hard global limit across ALL agents
+    sub_agent_max_calls: int = 8     # Max REPL rounds per sub-agent (depth>=1)
+    root_reserved_calls: int = 5     # Calls reserved for root agent synthesis
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     timeout: int = 180
@@ -449,9 +452,9 @@ class RLMEngine:
 
             async def llm_query(prompt: str) -> str:
                 # Check total sub-agent count before spawning
-                if engine_ref.usage.sub_agent_calls >= max_concurrent * 2:
-                    logger.warning(f"[depth={depth}] Sub-agent limit reached ({engine_ref.usage.sub_agent_calls}), skipping")
-                    return "[SUB-AGENT LIMIT REACHED - too many concurrent agents. Reduce chunk count.]"
+                if engine_ref.usage.sub_agent_calls >= max_concurrent:
+                    logger.warning(f"[depth={depth}] Sub-agent limit reached ({engine_ref.usage.sub_agent_calls} >= {max_concurrent}), skipping")
+                    return "[SUB-AGENT LIMIT REACHED - too many agents. Reduce chunk count or combine chunks.]"
                 sub_id = engine_ref.usage.sub_agent_calls + 1
                 engine_ref.usage.sub_agent_calls += 1
                 logger.info(f"[depth={depth}] Spawning sub-agent #{sub_id} at depth={depth+1} | prompt_len={len(prompt):,}")
@@ -525,10 +528,28 @@ class RLMEngine:
 
         self._log_step(depth, 0, initial_code, initial_output)
 
-        for step in range(self.config.max_calls_per_agent):
-            if self.usage.total_tokens > self.config.max_total_tokens:
-                logger.warning(f"[depth={depth}] Token budget exceeded: {self.usage.total_tokens:,} > {self.config.max_total_tokens:,}")
-                return "Error: Token budget exceeded."
+        # Sub-agents get fewer REPL rounds than the root agent
+        max_steps = self.config.max_calls_per_agent if depth == 0 else self.config.sub_agent_max_calls
+
+        for step in range(max_steps):
+            # --- PRE-CHECKS before each LLM call ---
+            # 1. Token budget (with 5% safety margin for parallel agents)
+            token_limit = int(self.config.max_total_tokens * 0.95)
+            if self.usage.total_tokens > token_limit:
+                logger.warning(f"[depth={depth}] Token budget exceeded: {self.usage.total_tokens:,} > {token_limit:,} (95% of {self.config.max_total_tokens:,})")
+                if sandbox.is_done:
+                    return sandbox.final_result
+                return f"[TOKEN BUDGET EXCEEDED after {step} steps — returning partial results]"
+
+            # 2. Global LLM call limit (sub-agents see a tighter limit to reserve calls for root synthesis)
+            effective_limit = self.config.max_total_llm_calls
+            if depth > 0:
+                effective_limit = self.config.max_total_llm_calls - self.config.root_reserved_calls
+            if self.usage.llm_calls >= effective_limit:
+                logger.warning(f"[depth={depth}] Global LLM call limit reached: {self.usage.llm_calls} >= {effective_limit} (reserved={self.config.root_reserved_calls if depth > 0 else 0} for root)")
+                if sandbox.is_done:
+                    return sandbox.final_result
+                return f"[CALL LIMIT REACHED after {self.usage.llm_calls} calls — returning partial results]"
 
             # Call LLM (synchronous)
             self.usage.llm_calls += 1
@@ -597,7 +618,7 @@ class RLMEngine:
             })
 
         total_elapsed = time.time() - agent_start
-        logger.warning(f"[depth={depth}] Agent hit step limit ({self.config.max_calls_per_agent}) after {total_elapsed:.1f}s")
+        logger.warning(f"[depth={depth}] Agent hit step limit ({max_steps}) after {total_elapsed:.1f}s")
         return "Agent did not produce a final answer within the step limit."
 
     def _log_step(self, depth: int, step: int, code: str, output: str):

@@ -111,6 +111,9 @@ def get_config() -> RLMConfig:
             truncate_len=int(os.environ.get("RLM_TRUNCATE_LEN", "10000")),
             max_total_tokens=int(os.environ.get("RLM_MAX_TOKENS", "1500000")),
             max_concurrent_agents=int(os.environ.get("RLM_MAX_CONCURRENT", "12")),
+            max_total_llm_calls=int(os.environ.get("RLM_MAX_LLM_CALLS", "50")),
+            sub_agent_max_calls=int(os.environ.get("RLM_SUB_AGENT_CALLS", "8")),
+            root_reserved_calls=int(os.environ.get("RLM_ROOT_RESERVED", "5")),
             openai_api_key=api_key,
             timeout=int(os.environ.get("RLM_TIMEOUT", "180")),
         )
