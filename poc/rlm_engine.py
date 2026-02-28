@@ -140,10 +140,9 @@ Make sure to explicitly look through as much context as possible before answerin
 3. Chunk the context into segments (e.g. 400K chars each for ~4.8M context = ~12 chunks)
 4. Launch PARALLEL subagents with `asyncio.gather()` — one per chunk — each searching for information relevant to the query
 5. Collect and review all subagent results
-6. If needed, do targeted deep-dives into specific documents found by subagents
-7. Save key findings with `add_finding()`
-8. Synthesize a comprehensive answer using another `llm_query` call with all collected evidence
-9. Print your answer to inspect it, then call FINAL()
+6. Save key findings with `add_finding()`
+7. Synthesize the answer YOURSELF in Python — do NOT use llm_query for synthesis! Just combine the subagent results with string operations. The subagents already did the analysis; you just need to format and merge their findings.
+8. Print your answer to inspect it, then call FINAL()
 
 Sub-LLMs are powerful — they can fit around 500K characters. Don't be afraid to put a lot of context into them. A viable strategy is to split 4.8M chars into 10 chunks and run 10 parallel subagents.
 
@@ -170,14 +169,26 @@ for i, answer in enumerate(answers):
     print(f"Chunk {i}: {answer[:500]}")
 ```
 
-After collecting chunk results, synthesize:
+After collecting chunk results, synthesize DIRECTLY in Python (do NOT call llm_query again!):
 ```repl
-evidence = "\\n\\n".join(f"=== Chunk {i} ===\\n{a}" for i, a in enumerate(answers) if a.strip())
-final_answer = await llm_query(f"Based on the following evidence from searching legal documents, provide a comprehensive answer to: {query}\\n\\nEvidence:\\n{evidence}")
-print(final_answer)
+# Combine all non-empty results
+parts = []
+for i, answer in enumerate(answers):
+    text = answer.strip() if answer else ""
+    if text and "[CALL LIMIT" not in text and "[TOKEN BUDGET" not in text:
+        parts.append(f"### Ergebnisse aus Abschnitt {i+1}\\n{text}")
+
+# Save findings for future queries
+for part in parts:
+    add_finding(part[:500])
+
+# Build final answer
+final_answer = f"## {query}\\n\\n" + "\\n\\n".join(parts)
+print(f"Answer length: {len(final_answer):,} chars, {len(parts)} sections")
+FINAL(final_answer)
 ```
 
-Then return: `FINAL(final_answer)`
+CRITICAL: Do NOT use `llm_query` for the final synthesis step — you will run out of budget! Just combine results with Python string operations and call FINAL() directly.
 
 IMPORTANT: When you are done, you MUST provide a final answer using FINAL(). Two options:
 1. Use FINAL("your final answer here") for direct answers
@@ -454,7 +465,12 @@ class RLMEngine:
                 # Check total sub-agent count before spawning
                 if engine_ref.usage.sub_agent_calls >= max_concurrent:
                     logger.warning(f"[depth={depth}] Sub-agent limit reached ({engine_ref.usage.sub_agent_calls} >= {max_concurrent}), skipping")
-                    return "[SUB-AGENT LIMIT REACHED - too many agents. Reduce chunk count or combine chunks.]"
+                    return "[SUB-AGENT LIMIT REACHED - synthesize results directly with Python instead of calling llm_query again.]"
+                # Check if call budget is nearly exhausted
+                sub_limit = engine_ref.config.max_total_llm_calls - engine_ref.config.root_reserved_calls
+                if engine_ref.usage.llm_calls >= sub_limit:
+                    logger.warning(f"[depth={depth}] Call budget exhausted for sub-agents ({engine_ref.usage.llm_calls} >= {sub_limit}), skipping")
+                    return "[CALL BUDGET EXHAUSTED - synthesize results directly with Python instead of calling llm_query again.]"
                 sub_id = engine_ref.usage.sub_agent_calls + 1
                 engine_ref.usage.sub_agent_calls += 1
                 logger.info(f"[depth={depth}] Spawning sub-agent #{sub_id} at depth={depth+1} | prompt_len={len(prompt):,}")
